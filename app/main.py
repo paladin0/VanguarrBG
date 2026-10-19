@@ -316,17 +316,29 @@ async def lifespan(app: FastAPI):
         runtime_settings.log_file,
     )
     logging.getLogger("vanguarr").info("Vanguarr startup complete.")
+    from app.api.catalogue import catalogue_auto_worker
+    catalogue_task = asyncio.create_task(catalogue_auto_worker(), name="catalogue-approved-worker")
     yield
+    catalogue_task.cancel()
+    try:
+        await catalogue_task
+    except asyncio.CancelledError:
+        pass
     logging.getLogger("vanguarr").info("Vanguarr shutting down.")
     scheduler.shutdown()
     await background_runner.shutdown()
 
+
+from app.api.catalogue import router as catalogue_router
 
 app = FastAPI(
     title="Vanguarr",
     summary="AI-driven proactive media curation bridge for the Arr stack.",
     lifespan=lifespan,
 )
+
+
+app.include_router(catalogue_router)
 
 
 @app.get("/")
