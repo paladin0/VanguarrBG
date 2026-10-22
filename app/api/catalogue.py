@@ -21,15 +21,102 @@ DATA_FILE = Path(os.environ.get('CATALOGUE_REVIEW_FILE', '/data/catalogue-review
 
 
 def _require_write_token(x_catalogue_token: str | None = Header(default=None)):
-    expected = os.getenv('CATALOGUE_WRITE_TOKEN', '').strip()
+    expected = catalogue_setting('CATALOGUE_WRITE_TOKEN').strip()
     if not expected:
         raise HTTPException(503, 'CATALOGUE_WRITE_TOKEN must be configured for mutations')
     if not x_catalogue_token or not secrets.compare_digest(expected, x_catalogue_token):
         raise HTTPException(403, 'Catalogue write access denied')
 
 
+# Runtime settings in the existing /data persistent volume. Environment values remain
+# bootstrap defaults; saved settings override them without container recreation.
+SETTINGS_FILE = Path(os.environ.get('CATALOGUE_SETTINGS_FILE', '/data/catalogue-settings.json'))
+CONFIG_FIELDS = {
+ 'CATALOGUE_LAZYLIBRARIAN_URL': 'url', 'CATALOGUE_LAZYLIBRARIAN_KEY': 'secret',
+ 'CATALOGUE_RETROARR_URL': 'url', 'CATALOGUE_RETROARR_KEY': 'secret',
+ 'CATALOGUE_IGDB_CLIENT_ID': 'text', 'CATALOGUE_IGDB_CLIENT_SECRET': 'secret',
+ 'CATALOGUE_HUNTARR_URL': 'url', 'CATALOGUE_HUNTARR_TOKEN': 'secret',
+ 'CATALOGUE_WRITE_TOKEN': 'secret',
+ 'CATALOGUE_AUTO_HUNT': 'bool', 'CATALOGUE_ENABLE_GAME_IMPORT': 'bool',
+ 'CATALOGUE_HUNT_INTERVAL_MINUTES': 'int',
+ 'CATALOGUE_DEFAULT_MIN_RATING': 'int', 'CATALOGUE_DEFAULT_MAX_PER_PLATFORM': 'int',
+ 'CATALOGUE_INCLUDE_UNRATED': 'bool',
+ 'CATALOGUE_WANT_EBOOK': 'bool', 'CATALOGUE_WANT_AUDIOBOOK': 'bool',
+}
+
+def _saved_settings():
+    with _lock:
+        try:
+            obj = json.loads(SETTINGS_FILE.read_text(encoding='utf-8'))
+            return obj if isinstance(obj, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (ValueError, OSError):
+            raise HTTPException(500, 'Cannot read catalogue settings')
+
+def catalogue_setting(name: str, default: str = '') -> str:
+    obj = _saved_settings()
+    if name in obj:
+        return str(obj[name])
+    return os.environ.get(name, default)
+
+class CatalogueSettingsUpdate(BaseModel):
+    settings: dict[str, str | int | bool]
+
+@router.get('/api/catalogue/settings')
+async def get_catalogue_settings():
+    saved = _saved_settings()
+    fields = {}
+    for name, kind in CONFIG_FIELDS.items():
+        value = str(saved.get(name, os.getenv(name, '')))
+        fields[name] = {'type': kind, 'value': '' if kind == 'secret' else value,
+                        'configured': bool(value)}
+    return {'fields': fields}
+
+@router.put('/api/catalogue/settings', dependencies=[Depends(_require_write_token)])
+async def update_catalogue_settings(payload: CatalogueSettingsUpdate):
+    unexpected = set(payload.settings) - CONFIG_FIELDS.keys()
+    if unexpected:
+        raise HTTPException(400, 'Unknown configuration field')
+    updated = _saved_settings()
+    for name, raw in payload.settings.items():
+        kind = CONFIG_FIELDS[name]
+        value = str(raw).strip()
+        if kind == 'secret' and not value:
+            continue  # Blank password means keep current value.
+        if kind == 'url' and value:
+            parts = urlparse(value)
+            if parts.scheme not in ('http','https') or not parts.hostname or parts.username or parts.password:
+                raise HTTPException(400, f'Invalid URL for {name}')
+            value = value.rstrip('/')
+        if kind == 'int':
+            try: number = int(value)
+            except ValueError: raise HTTPException(400, f'Invalid number for {name}')
+            if not (0 <= number <= 10000): raise HTTPException(400, f'Out of range: {name}')
+            value = str(number)
+        if kind == 'bool':
+            if value.lower() not in ('true','false'): raise HTTPException(400, f'Invalid boolean for {name}')
+            value = value.lower()
+        updated[name] = value
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', dir=SETTINGS_FILE.parent, delete=False, encoding='utf-8') as temp:
+        os.chmod(temp.name, 0o600)
+        json.dump(updated, temp, indent=2)
+        temp_name = temp.name
+    os.replace(temp_name, SETTINGS_FILE)
+    return {'saved': True}
+
+@router.get('/catalogue/settings', response_class=HTMLResponse)
+async def catalogue_settings_page(request: Request):
+    from fastapi.templating import Jinja2Templates
+    templates = Jinja2Templates(directory=str(Path(__file__).resolve().parents[1] / 'templates'))
+    return templates.TemplateResponse(request, 'catalogue_settings.html', {'page_title': 'Books, Audiobooks & Games Settings', 'path': '/catalogue/settings'})
+
+
+
 def _configured_url(env: str) -> str:
-    value = os.getenv(env, '').strip().rstrip('/')
+    value = catalogue_setting(env).strip().rstrip('/')
     if not value:
         raise HTTPException(503, f'{env} is not configured')
     parts = urlparse(value)
@@ -49,7 +136,7 @@ async def _json_get(url: str, *, headers: dict | None = None, params: dict | Non
 
 
 def _lazy_key() -> str:
-    key = os.getenv('CATALOGUE_LAZYLIBRARIAN_KEY', '').strip()
+    key = catalogue_setting('CATALOGUE_LAZYLIBRARIAN_KEY', '').strip()
     if not key:
         raise HTTPException(503, 'LazyLibrarian key not configured')
     return key
@@ -81,7 +168,7 @@ async def books(limit: int = Query(250, ge=1, le=1000)):
 @router.get('/api/catalogue/games/library')
 async def games_library():
     base = _configured_url('CATALOGUE_RETROARR_URL')
-    key = os.getenv('CATALOGUE_RETROARR_KEY','').strip()
+    key = catalogue_setting('CATALOGUE_RETROARR_KEY', '').strip()
     if not key:
         raise HTTPException(503, 'RetroArr API key not configured')
     data = await _json_get(base + '/api/v3/game',headers={'X-Api-Key':key})
@@ -92,8 +179,8 @@ async def games_library():
 
 
 async def _igdb_token():
-    client_id = os.getenv('CATALOGUE_IGDB_CLIENT_ID','').strip()
-    secret = os.getenv('CATALOGUE_IGDB_CLIENT_SECRET','').strip()
+    client_id = catalogue_setting('CATALOGUE_IGDB_CLIENT_ID', '').strip()
+    secret = catalogue_setting('CATALOGUE_IGDB_CLIENT_SECRET', '').strip()
     if not client_id or not secret:
         raise HTTPException(503,'IGDB Twitch client credentials not configured')
     try:
@@ -132,7 +219,10 @@ async def platforms():
 
 
 @router.get('/api/catalogue/games/discover')
-async def discover(platform_id: int = Query(...,gt=0),min_rating: float = Query(70,ge=0,le=100),limit: int = Query(250,ge=1,le=500),include_unrated: bool=False):
+async def discover(platform_id: int = Query(...,gt=0),min_rating: float | None = Query(None,ge=0,le=100),limit: int | None = Query(None,ge=1,le=500),include_unrated: bool | None=None):
+    if min_rating is None: min_rating = float(catalogue_setting('CATALOGUE_DEFAULT_MIN_RATING', '70'))
+    if limit is None: limit = max(1, min(500, int(catalogue_setting('CATALOGUE_DEFAULT_MAX_PER_PLATFORM', '250'))))
+    if include_unrated is None: include_unrated = catalogue_setting('CATALOGUE_INCLUDE_UNRATED', 'false').lower() == 'true'
     where=f'platforms = ({platform_id}) & category = 0'
     if include_unrated:
         where+=f' & (rating >= {min_rating} | rating = null)'
@@ -239,9 +329,9 @@ async def automation_status():
     for item in entries:
         status = item.get('state', 'pending')
         counts[status] = counts.get(status, 0) + 1
-    return {'counts': counts, 'auto_enabled': os.getenv('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true',
-            'game_writes_enabled': os.getenv('CATALOGUE_ENABLE_GAME_IMPORT', 'false').lower() == 'true',
-            'interval_minutes': int(os.getenv('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))}
+    return {'counts': counts, 'auto_enabled': catalogue_setting('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true',
+            'game_writes_enabled': catalogue_setting('CATALOGUE_ENABLE_GAME_IMPORT', 'false').lower() == 'true',
+            'interval_minutes': int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))}
 
 
 async def _ll_command(cmd: str, **params):
@@ -267,7 +357,7 @@ async def _ll_command_result(cmd: str, **params):
 async def _retroarr_request(method: str, path: str, *, payload: dict | None = None):
     """Call exact routes verified in RetroArr.Api.V3 source; no redirects."""
     base = _configured_url('CATALOGUE_RETROARR_URL')
-    key = os.getenv('CATALOGUE_RETROARR_KEY', '').strip()
+    key = catalogue_setting('CATALOGUE_RETROARR_KEY', '').strip()
     if not key:
         raise RuntimeError('CATALOGUE_RETROARR_KEY not configured')
     try:
@@ -288,7 +378,7 @@ async def _import_game(item: dict):
     The queue's platform_id refers to IGDB, not RetroArr's internal platform ID.
     Requires a trusted local RetroArr instance and explicit opt-in.
     """
-    if os.getenv('CATALOGUE_ENABLE_GAME_IMPORT', 'false').lower() != 'true':
+    if catalogue_setting('CATALOGUE_ENABLE_GAME_IMPORT', 'false').lower() != 'true':
         raise RuntimeError('Game writes disabled: set CATALOGUE_ENABLE_GAME_IMPORT=true after testing')
     igdb_id = int(item['external_id'])
     igdb_platform = int(item['platform_id'])
@@ -337,7 +427,7 @@ async def _import_game(item: dict):
 async def _submit_huntarr(item: dict, *, game_id: int | None = None):
     """Submit one approved record to Huntarr's persistent, bounded search queue."""
     base = _configured_url('CATALOGUE_HUNTARR_URL')
-    token = os.getenv('CATALOGUE_HUNTARR_TOKEN', '').strip()
+    token = catalogue_setting('CATALOGUE_HUNTARR_TOKEN', '').strip()
     if not token:
         raise RuntimeError('CATALOGUE_HUNTARR_TOKEN is required')
     payload = {
@@ -458,8 +548,8 @@ async def catalogue_auto_worker():
     # global forceBookSearch; use LazyLibrarian's native rate-limited scheduler.
     while True:
         try:
-            mins = max(15, min(1440, int(os.getenv('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))))
-            if os.getenv('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true':
+            mins = max(15, min(1440, int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))))
+            if catalogue_setting('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true':
                 await process_approved(max_items=10)
         except Exception:
             import logging
@@ -470,7 +560,7 @@ async def catalogue_auto_worker():
 async def retroarr_capabilities():
     """Read available API metadata, without guessing or invoking write routes."""
     base = _configured_url('CATALOGUE_RETROARR_URL')
-    key = os.getenv('CATALOGUE_RETROARR_KEY', '').strip()
+    key = catalogue_setting('CATALOGUE_RETROARR_KEY', '').strip()
     if not key:
         raise HTTPException(503, 'RetroArr API key not configured')
     candidates = ['/swagger/v1/swagger.json', '/openapi/v1.json', '/swagger.json', '/openapi.json']

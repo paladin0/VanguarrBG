@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="surface rounded-[1.5rem] p-6 space-y-5 max-w-5xl">
+ <div><p class="panel-kicker">Connections &amp; Automation</p><h1 class="text-3xl font-semibold mt-2">Books, Audiobooks &amp; Games</h1>
+ <p class="text-sm mt-3 text-[var(--text-soft)]">Saved in Vanguarr's persistent /data storage. Blank secret fields keep existing credentials. Automatic hunting and game importing are disabled by default.</p></div>
+ <div id="catalogue-settings-feedback" role="status" class="text-sm"></div>
+ <label class="block text-sm">Current catalogue administration token (for saving settings)<input id="catalogue-admin-token" type="password" class="field-input w-full text-sm mt-2" placeholder="Enter CATALOGUE_WRITE_TOKEN from TrueNAS YAML" autocomplete="off"></label>
+ <form id="catalogue-settings-form" class="space-y-6"><div id="catalogue-settings-fields" class="grid gap-4 md:grid-cols-2"></div>
+ <button type="submit" class="rounded-lg px-5 py-3 bg-blue-600 text-white font-semibold">Save Books &amp; Games settings</button></form>
+ <p class="text-xs text-[var(--text-soft)]">Changes apply to new requests without redeploying. Existing running requests keep their starting settings. Shared Huntarr credentials need to be configured in Huntarr separately.</p>
+</section>
+<script>
+const groupFields = [
+ ['LazyLibrarian','CATALOGUE_LAZYLIBRARIAN_URL','CATALOGUE_LAZYLIBRARIAN_KEY'],
+ ['RetroArr','CATALOGUE_RETROARR_URL','CATALOGUE_RETROARR_KEY'],
+ ['IGDB / Twitch','CATALOGUE_IGDB_CLIENT_ID','CATALOGUE_IGDB_CLIENT_SECRET'],
+ ['Huntarr approval forwarding','CATALOGUE_HUNTARR_URL','CATALOGUE_HUNTARR_TOKEN'],
+ ['Approval access token','CATALOGUE_WRITE_TOKEN'],
+ ['Discovery defaults','CATALOGUE_DEFAULT_MIN_RATING','CATALOGUE_DEFAULT_MAX_PER_PLATFORM','CATALOGUE_INCLUDE_UNRATED'],
+ ['Book formats','CATALOGUE_WANT_EBOOK','CATALOGUE_WANT_AUDIOBOOK'],
+ ['Automation (opt-in)','CATALOGUE_HUNT_INTERVAL_MINUTES','CATALOGUE_ENABLE_GAME_IMPORT','CATALOGUE_AUTO_HUNT']
+];
+const nice = k => k.replace(/^CATALOGUE_/, '').replaceAll('_',' ').toLowerCase().replace(/\b\w/g,c=>c.toUpperCase());
+let current = {};
+async function loadCatalogueSettings(){
+ const r=await fetch('/api/catalogue/settings');if(!r.ok)throw new Error('Cannot load settings');
+ current=(await r.json()).fields;const host=document.getElementById('catalogue-settings-fields');host.replaceChildren();
+ for(const [heading,...names] of groupFields){
+   const title=document.createElement('h2');title.textContent=heading;title.className='text-lg font-semibold md:col-span-2 mt-4';host.append(title);
+   for(const name of names){const config=current[name];if(!config)continue;
+     const wrapper=document.createElement('label');wrapper.className='block text-sm space-y-2';
+     const label=document.createElement('span');label.textContent=nice(name);label.className='block';wrapper.append(label);
+     const input=document.createElement('input');input.name=name;input.dataset.kind=config.type;
+     input.className='field-input w-full text-sm';
+     if(config.type==='bool'){input.type='checkbox';input.checked=config.value==='true';}
+     else {input.type=config.type==='secret'?'password':config.type==='int'?'number':config.type==='url'?'url':'text';
+       input.value=config.value; if(config.type==='secret')input.placeholder=config.configured?'Saved (leave blank to keep)':'Enter credential';}
+     wrapper.append(input);host.append(wrapper);
+   }
+ }
+}
+document.getElementById('catalogue-settings-form').addEventListener('submit',async e=>{
+ e.preventDefault();const feedback=document.getElementById('catalogue-settings-feedback');
+ const settings={};for(const el of e.currentTarget.querySelectorAll('[name]')){
+   if(el.dataset.kind==='secret' && !el.value.trim())continue;
+   settings[el.name]=el.dataset.kind==='bool'?String(el.checked):el.value;
+ }
+ try{const response=await fetch('/api/catalogue/settings',{method:'PUT',headers:{'Content-Type':'application/json','X-Catalogue-Token':document.getElementById('catalogue-admin-token').value},body:JSON.stringify({settings})});
+ if(!response.ok)throw new Error((await response.text()).slice(0,200));feedback.textContent='Settings saved successfully';await loadCatalogueSettings();}
+ catch(err){feedback.textContent='Save failed: '+err.message+' (If approval token is required, supply it in the deployment configuration for the initial setup.)';}
+});
+loadCatalogueSettings().catch(e=>document.getElementById('catalogue-settings-feedback').textContent=e.message);
+</script>
+{% endblock %}
