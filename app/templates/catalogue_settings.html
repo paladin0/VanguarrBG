@@ -5,6 +5,11 @@
  <p class="text-sm mt-3 text-[var(--text-soft)]">Saved in Vanguarr's persistent /data storage. Blank secret fields keep existing credentials. Automatic hunting and game importing are disabled by default.</p></div>
  <div id="catalogue-settings-feedback" role="status" class="text-sm"></div>
  <label class="block text-sm">Current catalogue administration token (for saving settings)<input id="catalogue-admin-token" type="password" class="field-input w-full text-sm mt-2" placeholder="Enter CATALOGUE_WRITE_TOKEN from TrueNAS YAML" autocomplete="off"></label>
+ <div class="flex flex-wrap gap-3 items-center">
+  <button id="catalogue-connection-test" type="button" class="rounded-lg px-5 py-3 bg-sky-700 text-white font-semibold">Test saved LazyLibrarian &amp; RetroArr connections</button>
+  <span class="text-xs text-[var(--text-soft)]">Tests saved credentials, not unsaved form entries.</span>
+ </div>
+ <div id="catalogue-test-results" role="status" aria-live="polite" class="text-sm whitespace-pre-line"></div>
  <form id="catalogue-settings-form" class="space-y-6"><div id="catalogue-settings-fields" class="grid gap-4 md:grid-cols-2"></div>
  <button type="submit" class="rounded-lg px-5 py-3 bg-blue-600 text-white font-semibold">Save Books &amp; Games settings</button></form>
  <p class="text-xs text-[var(--text-soft)]">Changes apply to new requests without redeploying. Existing running requests keep their starting settings. Shared Huntarr credentials need to be configured in Huntarr separately.</p>
@@ -48,6 +53,22 @@ document.getElementById('catalogue-settings-form').addEventListener('submit',asy
  try{const response=await fetch('/api/catalogue/settings',{method:'PUT',headers:{'Content-Type':'application/json','X-Catalogue-Token':document.getElementById('catalogue-admin-token').value},body:JSON.stringify({settings})});
  if(!response.ok)throw new Error((await response.text()).slice(0,200));feedback.textContent='Settings saved successfully';await loadCatalogueSettings();}
  catch(err){feedback.textContent='Save failed: '+err.message+' (If approval token is required, supply it in the deployment configuration for the initial setup.)';}
+});
+document.getElementById('catalogue-connection-test').addEventListener('click', async () => {
+ const button=document.getElementById('catalogue-connection-test');
+ const output=document.getElementById('catalogue-test-results');
+ button.disabled=true;output.textContent='Testing saved credentials…';
+ try {
+   const response=await fetch('/api/catalogue/connections/test',{cache:'no-store'});
+   if(!response.ok)throw new Error('Test endpoint returned HTTP '+response.status);
+   const data=await response.json();
+   output.textContent=['lazylibrarian','retroarr'].map(name=>{
+     const result=data.checks?.[name];
+     return (name==='lazylibrarian'?'LazyLibrarian':'RetroArr')+': '+
+       (result?.ok?'Connected ('+result.count+' records)':(result?.error||'Test failed'));
+   }).join('\n');
+ } catch(error){output.textContent='Connection test failed: '+error.message;}
+ finally{button.disabled=false;}
 });
 loadCatalogueSettings().catch(e=>document.getElementById('catalogue-settings-feedback').textContent=e.message);
 </script>

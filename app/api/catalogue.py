@@ -129,10 +129,62 @@ async def _json_get(url: str, *, headers: dict | None = None, params: dict | Non
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=False) as client:
             response = await client.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            return response.json()
-    except (httpx.HTTPError, ValueError) as exc:
+            if response.status_code in (401, 403):
+                raise HTTPException(502, f'Upstream authentication rejected (HTTP {response.status_code}); check the API key saved in Vanguarr Books & Games Settings')
+            if response.status_code >= 400:
+                raise HTTPException(502, f'Upstream returned HTTP {response.status_code}; check the configured service URL and API access')
+            if response.is_redirect:
+                raise HTTPException(502, f'Upstream redirected (HTTP {response.status_code}); check the configured URL')
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise HTTPException(502, 'Upstream did not return JSON; check service URL and API authentication') from exc
+    except httpx.HTTPError as exc:
         raise HTTPException(502, f'Upstream connection failed: {type(exc).__name__}') from exc
+
+
+def _unwrap_catalogue_records(data, *, label: str, candidates: tuple[str, ...]):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in candidates:
+            if isinstance(data.get(key), list):
+                return data[key]
+        # LazyLibrarian can return a JSON error object with HTTP 200.
+        # Do not echo any upstream body which may contain sensitive details.
+        if any(k in data for k in ('error', 'Error', 'message', 'Message', 'status', 'Status')):
+            raise HTTPException(502, f'{label} returned an error object; verify the API key in Vanguarr settings')
+    raise HTTPException(502, f'Unexpected {label} response format; check the connection settings')
+
+
+@router.get('/api/catalogue/connections/test')
+async def catalogue_connections_test():
+    """Read-only authenticated probes using the credentials Vanguarr actually has saved."""
+    checks = {}
+    try:
+        author_data = await _json_get(
+            _configured_url('CATALOGUE_LAZYLIBRARIAN_URL') + '/api',
+            params={'cmd': 'getIndex', 'apikey': _lazy_key()},
+        )
+        authors = _unwrap_catalogue_records(author_data, label='LazyLibrarian',
+                                             candidates=('authors', 'Authors', 'items', 'data'))
+        checks['lazylibrarian'] = {'ok': True, 'count': len(authors)}
+    except HTTPException as exc:
+        checks['lazylibrarian'] = {'ok': False, 'error': str(exc.detail)}
+    try:
+        key = catalogue_setting('CATALOGUE_RETROARR_KEY').strip()
+        if not key:
+            raise HTTPException(503, 'RetroArr key not configured in Vanguarr')
+        game_data = await _json_get(
+            _configured_url('CATALOGUE_RETROARR_URL') + '/api/v3/game',
+            headers={'X-Api-Key': key},
+        )
+        games = _unwrap_catalogue_records(game_data, label='RetroArr',
+                                           candidates=('records', 'items', 'data'))
+        checks['retroarr'] = {'ok': True, 'count': len(games)}
+    except HTTPException as exc:
+        checks['retroarr'] = {'ok': False, 'error': str(exc.detail)}
+    return {'checks': checks, 'ok': all(x['ok'] for x in checks.values())}
 
 
 def _lazy_key() -> str:
@@ -152,16 +204,16 @@ async def catalogue_page(request: Request):
 @router.get('/api/catalogue/books/authors')
 async def authors():
     data = await _json_get(_configured_url('CATALOGUE_LAZYLIBRARIAN_URL') + '/api', params={'cmd':'getIndex','apikey':_lazy_key()})
-    if not isinstance(data, list):
-        raise HTTPException(502, 'Unexpected author format from LazyLibrarian')
+    data = _unwrap_catalogue_records(data, label='LazyLibrarian authors',
+                                     candidates=('authors', 'Authors', 'items', 'data'))
     return {'count': len(data), 'items': [{'id': str(a.get('AuthorID','')), 'name':a.get('AuthorName',''), 'status':a.get('Status',''), 'books':a.get('TotalBooks',0)} for a in data if isinstance(a,dict)]}
 
 
 @router.get('/api/catalogue/books/titles')
 async def books(limit: int = Query(250, ge=1, le=1000)):
     data = await _json_get(_configured_url('CATALOGUE_LAZYLIBRARIAN_URL') + '/api', params={'cmd':'getAllBooks','apikey':_lazy_key()})
-    if not isinstance(data, list):
-        raise HTTPException(502, 'Unexpected book format from LazyLibrarian')
+    data = _unwrap_catalogue_records(data, label='LazyLibrarian books',
+                                     candidates=('books', 'Books', 'items', 'data'))
     return {'count':len(data), 'items':[{'id':str(b.get('BookID','')), 'title':b.get('BookName',''), 'author':b.get('AuthorName',''), 'ebook':b.get('Status',''), 'audiobook':b.get('AudioStatus','')} for b in data[:limit] if isinstance(b,dict)]}
 
 
@@ -172,9 +224,8 @@ async def games_library():
     if not key:
         raise HTTPException(503, 'RetroArr API key not configured')
     data = await _json_get(base + '/api/v3/game',headers={'X-Api-Key':key})
-    items = data if isinstance(data,list) else data.get('records',data.get('items',[])) if isinstance(data,dict) else []
-    if not isinstance(items,list):
-        raise HTTPException(502,'Unrecognised RetroArr game list format')
+    items = _unwrap_catalogue_records(data, label='RetroArr games',
+                                      candidates=('records', 'items', 'data'))
     return {'count':len(items),'items':items[:500]}
 
 
