@@ -5,6 +5,7 @@ import json
 import os
 import asyncio
 import secrets
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -292,8 +293,21 @@ async def _igdb_query(endpoint, query):
             if not isinstance(data,list):
                 raise ValueError('unexpected IGDB result')
             return data
-    except (httpx.HTTPError,ValueError) as exc:
-        raise HTTPException(502,'IGDB query failed') from exc
+    except httpx.HTTPStatusError as exc:
+        # Never leak the credentials or token; report the upstream status and
+        # validation message so a bad query is actionable.
+        upstream = exc.response
+        detail = 'IGDB HTTP ' + str(upstream.status_code)
+        if upstream.status_code == 400:
+            try:
+                issues = upstream.json()
+                if isinstance(issues, list) and issues:
+                    detail += ': ' + str(issues[0].get('details') or issues[0].get('title') or 'invalid query')[:180]
+            except (ValueError, TypeError, AttributeError):
+                pass
+        raise HTTPException(502, detail) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(502, 'IGDB query failed (' + type(exc).__name__ + ')') from exc
 
 
 @router.get('/api/catalogue/games/platforms')
@@ -315,11 +329,14 @@ async def discover(platform_id: int = Query(...,gt=0),min_rating: float | None =
     if min_rating is None: min_rating = float(catalogue_setting('CATALOGUE_DEFAULT_MIN_RATING', '70'))
     if limit is None: limit = max(1, min(2500, int(catalogue_setting('CATALOGUE_DEFAULT_MAX_PER_PLATFORM', '250'))))
     if include_unrated is None: include_unrated = catalogue_setting('CATALOGUE_INCLUDE_UNRATED', 'false').lower() == 'true'
+    # IGDB APICalypse rejects decimal literals in rating comparisons (70.0).
+    # Round upward so fractional thresholds never admit a lower-rated game.
+    rating_floor = math.ceil(float(min_rating))
     where=f'platforms = ({platform_id}) & category = 0'
     if include_unrated:
-        where+=f' & (rating >= {min_rating} | rating = null)'
+        where+=f' & (rating >= {rating_floor} | rating = null)'
     else:
-        where+=f' & rating >= {min_rating} & rating_count > 0'
+        where+=f' & rating >= {rating_floor} & rating_count > 0'
     results=[]
     # IGDB enforces 500 per request; paginate and deduplicate game IDs.
     for offset in range(0,limit,500):
@@ -460,9 +477,10 @@ async def _bulk_discovery_step():
                 if current.get('state') == 'running' and current.get('next_index') == idx:
                     current['errors'] = (current.get('errors') or [])[-49:] + [
                         {'platform_id': platform_id, 'error': str(exc)[:160]}]
-                    current['next_index'] = idx + 1
-                    if current['next_index'] >= len(ids):
-                        current['state'] = 'completed_with_errors'
+                    # Do not silently skip a platform that was never scanned.
+                    # Pause the job at its current index for inspection/restart.
+                    current['state'] = 'paused_error'
+                    current['current_platform'] = platform_id
                     _save_bulk(current)
 
 
