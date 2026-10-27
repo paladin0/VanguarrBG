@@ -38,7 +38,7 @@ async function loadCatalogueSettings(){
      input.className='field-input w-full text-sm';
      if(config.type==='bool'){input.type='checkbox';input.checked=config.value==='true';}
      else {input.type=config.type==='secret'?'password':config.type==='int'?'number':config.type==='url'?'url':'text';
-       input.value=config.value; if(config.type==='secret')input.placeholder=config.configured?'Saved (leave blank to keep)':'Enter credential';}
+       input.value=config.value ?? ''; if(config.type==='secret')input.placeholder=config.configured?'Saved (leave blank to keep)':'Enter credential';}
      wrapper.append(input);host.append(wrapper);
    }
  }
@@ -49,7 +49,7 @@ document.getElementById('catalogue-settings-form').addEventListener('submit',asy
    if(el.dataset.kind==='secret' && !el.value.trim())continue;
    settings[el.name]=el.dataset.kind==='bool'?String(el.checked):el.value;
  }
- try{const response=await fetch('/api/catalogue/settings',{method:'PUT',headers:{'Content-Type':'application/json','X-Catalogue-Token':document.getElementById('catalogue-admin-token').value},body:JSON.stringify({settings})});
+ try{const response=await fetch('/api/catalogue/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings})});
  if(!response.ok)throw new Error((await response.text()).slice(0,200));feedback.textContent='Settings saved successfully';await loadCatalogueSettings();}
  catch(err){feedback.textContent='Save failed: '+err.message;}
 });
