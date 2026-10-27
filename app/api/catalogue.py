@@ -21,6 +21,8 @@ from app.core.models import AppSetting
 router = APIRouter()
 _lock = Lock()
 DATA_FILE = Path(os.environ.get('CATALOGUE_REVIEW_FILE', '/data/catalogue-review.json'))
+BULK_FILE = DATA_FILE.with_name('catalogue-bulk-job.json')
+_bulk_step_lock = asyncio.Lock()
 
 
 def _require_write_token(x_catalogue_token: str | None = Header(default=None)):
@@ -298,18 +300,20 @@ async def _igdb_query(endpoint, query):
 async def platforms():
     # Pages of 500. Includes classic computers, handhelds and arcades.
     all_platforms=[]
-    for offset in range(0, 1000, 500):
+    for offset in range(0, 5000, 500):
         batch=await _igdb_query('platforms',f'fields id,name,abbreviation,category; sort name asc; limit 500; offset {offset};')
         all_platforms.extend(batch)
         if len(batch)<500:
             break
-    return {'count':len(all_platforms),'items':all_platforms}
+    # Deduplicate platform entries; IGDB occasionally repeats results across pages.
+    distinct = {int(p['id']): p for p in all_platforms if p.get('id')}
+    return {'count':len(distinct),'items':list(distinct.values())}
 
 
 @router.get('/api/catalogue/games/discover')
-async def discover(platform_id: int = Query(...,gt=0),min_rating: float | None = Query(None,ge=0,le=100),limit: int | None = Query(None,ge=1,le=500),include_unrated: bool | None=None):
+async def discover(platform_id: int = Query(...,gt=0),min_rating: float | None = Query(None,ge=0,le=100),limit: int | None = Query(None,ge=1,le=2500),include_unrated: bool | None=None):
     if min_rating is None: min_rating = float(catalogue_setting('CATALOGUE_DEFAULT_MIN_RATING', '70'))
-    if limit is None: limit = max(1, min(500, int(catalogue_setting('CATALOGUE_DEFAULT_MAX_PER_PLATFORM', '250'))))
+    if limit is None: limit = max(1, min(2500, int(catalogue_setting('CATALOGUE_DEFAULT_MAX_PER_PLATFORM', '250'))))
     if include_unrated is None: include_unrated = catalogue_setting('CATALOGUE_INCLUDE_UNRATED', 'false').lower() == 'true'
     where=f'platforms = ({platform_id}) & category = 0'
     if include_unrated:
@@ -326,6 +330,140 @@ async def discover(platform_id: int = Query(...,gt=0),min_rating: float | None =
     for game in results:
         items.append({'id':game.get('id'),'title':game.get('name',''), 'rating':game.get('rating'), 'rating_count':game.get('rating_count',0), 'year':datetime.fromtimestamp(game['first_release_date'],tz=timezone.utc).year if game.get('first_release_date') else None,'platform_id':platform_id})
     return {'count':len(items),'items':items}
+
+
+# Persistent platform-wide catalogue scanner. Queuing and approval remain explicit.
+# One platform is scanned per worker step; a failed platform is recorded and can
+# be retried in a new plan without discarding previously queued entries.
+class BulkDiscoveryRequest(BaseModel):
+    platform_ids: list[int] = Field(default_factory=list, max_length=1000)
+    all_platforms: bool = False
+    min_rating: float = Field(default=70, ge=0, le=100)
+    max_per_platform: int = Field(default=250, ge=1, le=2500)
+    include_unrated: bool = False
+    approve_matching: bool = False
+
+
+def _load_bulk():
+    if not BULK_FILE.exists():
+        return {'state': 'idle', 'platform_ids': [], 'next_index': 0, 'queued': 0, 'errors': []}
+    try:
+        data = json.loads(BULK_FILE.read_text(encoding='utf-8'))
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    raise HTTPException(500, 'Cannot read bulk discovery state')
+
+
+def _save_bulk(data):
+    BULK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = BULK_FILE.with_suffix('.tmp')
+    temp.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    temp.replace(BULK_FILE)
+
+
+@router.get('/api/catalogue/games/bulk')
+async def bulk_status():
+    with _lock:
+        return _load_bulk()
+
+
+@router.post('/api/catalogue/games/bulk', dependencies=[Depends(_require_write_token)])
+async def start_bulk(req: BulkDiscoveryRequest):
+    with _lock:
+        active = _load_bulk()
+        if active.get('state') == 'running':
+            raise HTTPException(409, 'Stop the current bulk discovery first')
+    if req.all_platforms:
+        entries = (await platforms())['items']
+        ids = sorted(set(int(p['id']) for p in entries if int(p.get('id') or 0) > 0))
+    else:
+        ids = sorted(set(i for i in req.platform_ids if i > 0))
+    if not ids:
+        raise HTTPException(400, 'Choose at least one platform')
+    job = {'state': 'running', 'platform_ids': ids, 'next_index': 0,
+           'queued': 0, 'skipped': 0, 'errors': [], 'current_platform': None,
+           'min_rating': req.min_rating, 'max_per_platform': req.max_per_platform,
+           'include_unrated': req.include_unrated, 'approve_matching': req.approve_matching,
+           'started_at': datetime.now(timezone.utc).isoformat()}
+    with _lock:
+        _save_bulk(job)
+    return job
+
+
+@router.post('/api/catalogue/games/bulk/stop', dependencies=[Depends(_require_write_token)])
+async def stop_bulk():
+    with _lock:
+        job = _load_bulk()
+        job['state'] = 'stopped'
+        _save_bulk(job)
+    return job
+
+
+async def _bulk_discovery_step():
+    if _bulk_step_lock.locked():
+        return
+    async with _bulk_step_lock:
+        with _lock:
+            job = _load_bulk()
+        if job.get('state') != 'running':
+            return
+        idx = int(job.get('next_index', 0))
+        ids = job.get('platform_ids', [])
+        if idx >= len(ids):
+            with _lock:
+                current = _load_bulk()
+                if current.get('state') == 'running':
+                    current['state'] = 'completed'
+                    _save_bulk(current)
+            return
+        platform_id = int(ids[idx])
+        try:
+            response = await discover(platform_id=platform_id,
+                min_rating=float(job['min_rating']), limit=int(job['max_per_platform']),
+                include_unrated=bool(job['include_unrated']))
+            fresh = 0
+            duplicates = 0
+            with _lock:
+                current = _load_bulk()
+                if current.get('state') != 'running' or int(current.get('next_index',0)) != idx:
+                    return
+                entries = _read_review()
+                existing = {_item_key(item) for item in entries}
+                for game in response['items']:
+                    if not game.get('id') or not game.get('title'):
+                        continue
+                    rec = {'kind':'game', 'external_id':str(game['id']),
+                           'title':game['title'], 'platform_id':platform_id,
+                           'rating':game.get('rating'), 'requested_formats':[],
+                           'state':'approved' if job['approve_matching'] else 'pending',
+                           'attempts':0, 'last_error':'', 'processed_at':None}
+                    key = _item_key(rec)
+                    if key in existing:
+                        duplicates += 1
+                    else:
+                        entries.append(rec)
+                        existing.add(key)
+                        fresh += 1
+                _save_review(entries)
+                current['queued'] = int(current.get('queued',0)) + fresh
+                current['skipped'] = int(current.get('skipped',0)) + duplicates
+                current['next_index'] = idx + 1
+                current['current_platform'] = platform_id
+                if current['next_index'] >= len(ids):
+                    current['state'] = 'completed'
+                _save_bulk(current)
+        except Exception as exc:
+            with _lock:
+                current = _load_bulk()
+                if current.get('state') == 'running' and current.get('next_index') == idx:
+                    current['errors'] = (current.get('errors') or [])[-49:] + [
+                        {'platform_id': platform_id, 'error': str(exc)[:160]}]
+                    current['next_index'] = idx + 1
+                    if current['next_index'] >= len(ids):
+                        current['state'] = 'completed_with_errors'
+                    _save_bulk(current)
 
 
 class ReviewItem(BaseModel):
@@ -632,17 +770,23 @@ async def recommend(request: RecommendRequest):
 
 
 async def catalogue_auto_worker():
-    # Start only when specifically enabled. Deliberately does NOT trigger a
-    # global forceBookSearch; use LazyLibrarian's native rate-limited scheduler.
+    # One persistent discovery step every 20 seconds, including after restart.
+    # Approved imports run separately at the configured interval and are opt-in.
+    elapsed = 0
     while True:
         try:
+            await _bulk_discovery_step()
             mins = max(15, min(1440, int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))))
-            if catalogue_setting('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true':
-                await process_approved(max_items=10)
+            interval_seconds = mins * 60
+            if elapsed >= interval_seconds:
+                if catalogue_setting('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true':
+                    await process_approved(max_items=10)
+                elapsed = 0
         except Exception:
             import logging
             logging.getLogger(__name__).exception('Catalogue worker iteration failed')
-        await asyncio.sleep(mins * 60)
+        await asyncio.sleep(20)
+        elapsed += 20
 
 @router.get('/api/catalogue/games/capabilities')
 async def retroarr_capabilities():
