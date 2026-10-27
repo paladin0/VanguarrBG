@@ -14,6 +14,9 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Header, Depends
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from app.core.db import SessionLocal
+from app.core.models import AppSetting
 
 router = APIRouter()
 _lock = Lock()
@@ -23,7 +26,7 @@ DATA_FILE = Path(os.environ.get('CATALOGUE_REVIEW_FILE', '/data/catalogue-review
 def _require_write_token(x_catalogue_token: str | None = Header(default=None)):
     expected = catalogue_setting('CATALOGUE_WRITE_TOKEN').strip()
     if not expected:
-        raise HTTPException(503, 'CATALOGUE_WRITE_TOKEN must be configured for mutations')
+        return  # Match Vanguarr's existing LAN settings behaviour when no approval token is configured.
     if not x_catalogue_token or not secrets.compare_digest(expected, x_catalogue_token):
         raise HTTPException(403, 'Catalogue write access denied')
 
@@ -45,19 +48,29 @@ CONFIG_FIELDS = {
 }
 
 def _saved_settings():
+    """Read catalogue settings from Vanguarr's existing app_settings database.
+
+    Old V5/V6 /data JSON settings are used only as a migration source; DB wins.
+    """
     with _lock:
+        legacy = {}
         try:
-            obj = json.loads(SETTINGS_FILE.read_text(encoding='utf-8'))
-            return obj if isinstance(obj, dict) else {}
+            raw = json.loads(SETTINGS_FILE.read_text(encoding='utf-8'))
+            if isinstance(raw, dict):
+                legacy = {k: str(v) for k, v in raw.items() if k in CONFIG_FIELDS}
         except FileNotFoundError:
-            return {}
-        except (ValueError, OSError):
-            raise HTTPException(500, 'Cannot read catalogue settings')
+            pass
+        except (OSError, ValueError):
+            raise HTTPException(500, 'Cannot read legacy catalogue settings')
+        with SessionLocal() as session:
+            rows = session.scalars(select(AppSetting).where(AppSetting.key.in_(list(CONFIG_FIELDS)))).all()
+            saved = {row.key: row.value for row in rows}
+        return {**legacy, **saved}
 
 def catalogue_setting(name: str, default: str = '') -> str:
-    obj = _saved_settings()
-    if name in obj:
-        return str(obj[name])
+    saved = _saved_settings()
+    if name in saved:
+        return saved[name]
     return os.environ.get(name, default)
 
 class CatalogueSettingsUpdate(BaseModel):
@@ -73,8 +86,12 @@ async def get_catalogue_settings():
                         'configured': bool(value)}
     return {'fields': fields}
 
-@router.put('/api/catalogue/settings', dependencies=[Depends(_require_write_token)])
-async def update_catalogue_settings(payload: CatalogueSettingsUpdate):
+@router.put('/api/catalogue/settings')
+async def update_catalogue_settings(payload: CatalogueSettingsUpdate, request: Request):
+    # Reject cross-origin browser writes; like Vanguarr core settings, LAN access is trusted.
+    origin = request.headers.get("origin")
+    if origin and urlparse(origin).netloc != request.url.netloc:
+        raise HTTPException(403, "Cross-origin settings changes are not allowed")
     unexpected = set(payload.settings) - CONFIG_FIELDS.keys()
     if unexpected:
         raise HTTPException(400, 'Unknown configuration field')
@@ -98,13 +115,18 @@ async def update_catalogue_settings(payload: CatalogueSettingsUpdate):
             if value.lower() not in ('true','false'): raise HTTPException(400, f'Invalid boolean for {name}')
             value = value.lower()
         updated[name] = value
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    import tempfile
-    with tempfile.NamedTemporaryFile('w', dir=SETTINGS_FILE.parent, delete=False, encoding='utf-8') as temp:
-        os.chmod(temp.name, 0o600)
-        json.dump(updated, temp, indent=2)
-        temp_name = temp.name
-    os.replace(temp_name, SETTINGS_FILE)
+    # Store alongside all existing Vanguarr settings in app_settings.
+    with _lock:
+        with SessionLocal.begin() as session:
+            existing = {row.key: row for row in session.scalars(
+                select(AppSetting).where(AppSetting.key.in_(list(CONFIG_FIELDS)))
+            ).all()}
+            for name, value in updated.items():
+                row = existing.get(name)
+                if row is None:
+                    session.add(AppSetting(key=name, value=value))
+                else:
+                    row.value = value
     return {'saved': True}
 
 @router.get('/catalogue/settings', response_class=HTMLResponse)
