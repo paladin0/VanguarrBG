@@ -332,11 +332,13 @@ async def discover(platform_id: int = Query(...,gt=0),min_rating: float | None =
     # IGDB APICalypse rejects decimal literals in rating comparisons (70.0).
     # Round upward so fractional thresholds never admit a lower-rated game.
     rating_floor = math.ceil(float(min_rating))
-    where=f'platforms = ({platform_id}) & category = 0'
+    # IGDB category=0 excludes otherwise valid original releases in the current API.
+    # Use platform membership plus the configured rating filter only.
+    where=f'platforms = ({platform_id})'
     if include_unrated:
         where+=f' & (rating >= {rating_floor} | rating = null)'
     else:
-        where+=f' & rating >= {rating_floor} & rating_count > 0'
+        where+=f' & rating >= {rating_floor}'
     results=[]
     # IGDB enforces 500 per request; paginate and deduplicate game IDs.
     for offset in range(0,limit,500):
