@@ -130,6 +130,7 @@ CONFIG_FIELDS = {
  'CATALOGUE_WRITE_TOKEN': 'secret',
  'CATALOGUE_AUTO_HUNT': 'bool', 'CATALOGUE_ENABLE_GAME_IMPORT': 'bool',
  'CATALOGUE_HUNT_INTERVAL_MINUTES': 'int',
+ 'CATALOGUE_GAME_BATCH_SIZE': 'int',
  'CATALOGUE_DEFAULT_MIN_RATING': 'int', 'CATALOGUE_DEFAULT_MAX_PER_PLATFORM': 'int',
  'CATALOGUE_INCLUDE_UNRATED': 'bool',
  'CATALOGUE_WANT_EBOOK': 'bool', 'CATALOGUE_WANT_AUDIOBOOK': 'bool',
@@ -139,7 +140,8 @@ CONFIG_FIELDS = {
 CATALOGUE_DEFAULTS = {
     'CATALOGUE_DEFAULT_MIN_RATING': '70',
     'CATALOGUE_DEFAULT_MAX_PER_PLATFORM': '250',
-    'CATALOGUE_HUNT_INTERVAL_MINUTES': '360',
+    'CATALOGUE_HUNT_INTERVAL_MINUTES': '1',
+    'CATALOGUE_GAME_BATCH_SIZE': '5',
     'CATALOGUE_INCLUDE_UNRATED': 'false',
     'CATALOGUE_WANT_EBOOK': 'true',
     'CATALOGUE_WANT_AUDIOBOOK': 'true',
@@ -703,7 +705,8 @@ async def automation_status():
         counts[status] = counts.get(status, 0) + 1
     return {'counts': counts, 'auto_enabled': catalogue_setting('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true',
             'game_writes_enabled': catalogue_setting('CATALOGUE_ENABLE_GAME_IMPORT', 'false').lower() == 'true',
-            'interval_minutes': int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))}
+            'interval_minutes': int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '1')),
+            'batch_size': int(catalogue_setting('CATALOGUE_GAME_BATCH_SIZE', '5'))}
 
 
 async def _ll_command(cmd: str, **params):
@@ -777,7 +780,7 @@ async def _import_game(item: dict):
         raise RuntimeError(f'IGDB game {igdb_id} not found by RetroArr')
     metadata['platformId'] = platform_id
     metadata['igdbId'] = igdb_id
-    metadata['monitored'] = False
+    metadata['monitored'] = True
     metadata.pop('id', None)
 
     existing = await _retroarr_request('GET', '/api/v3/game')
@@ -799,8 +802,6 @@ async def _import_game(item: dict):
 
     await _retroarr_request('PUT', f'/api/v3/games/{game_id}/monitored',
                             payload={'monitored': True})
-    # Deliberately do not issue /search-now?autoDispatch=true: selection is
-    # review-only and a separate scheduler should control searching.
     return game_id, f'{result}; monitoring enabled (game {game_id}, platform {platform_id})'
 
 
@@ -832,8 +833,19 @@ async def _process_one(item: dict):
     kind = item.get('kind')
     if kind == 'game':
         game_id, message = await _import_game(item)
-        await _submit_huntarr(item, game_id=game_id)
-        return message + '; queued for Huntarr search'
+        # RetroArr's own monitored-game search route can dispatch a selected
+        # release to its configured download client. This avoids depending on
+        # Huntarr's optional media-hunt token and its independent scheduler.
+        result = await _retroarr_request(
+            'POST', f'/api/v3/games/{game_id}/search-now?autoDispatch=true')
+        if not isinstance(result, dict):
+            raise RuntimeError('RetroArr search returned an unexpected response')
+        if result.get('error'):
+            raise RuntimeError(f"RetroArr search error: {str(result['error'])[:180]}")
+        if result.get('autoQueued') is True:
+            return message + '; release queued to RetroArr download client'
+        reason = str(result.get('autoDispatchSkipped') or 'no qualifying release found')[:180]
+        return message + '; search completed, nothing queued (' + reason + ')'
     if kind == 'author':
         # Add author by ID or name; no bulk Wanted action while book catalogue
         # metadata is incomplete. Author metadata refresh is handled in LL.
@@ -866,10 +878,20 @@ async def process_approved(*, max_items: int = 10):
     with _lock:
         entries = _read_review()
         selected = []
+        # Unmapped items remain approved for future remapping. Do not burn
+        # attempts on known unsupported IGDB platforms.
+        platform_cache = _cache_read('retroarr_platforms') or {'items': []}
+        supported = {int(p['igdbPlatformId']) for p in platform_cache['items']
+                     if isinstance(p, dict) and p.get('enabled')
+                     and p.get('igdbPlatformId') is not None}
         for item in entries:
-            if item.get('state') == 'approved' and len(selected) < max_items:
-                item['state'] = 'processing'
-                selected.append(dict(item))
+            if item.get('state') != 'approved' or len(selected) >= max_items:
+                continue
+            if (item.get('kind') == 'game' and supported
+                    and int(item.get('platform_id') or 0) not in supported):
+                continue
+            item['state'] = 'processing'
+            selected.append(dict(item))
         _save_review(entries)
     results = []
     for item in selected:
@@ -952,11 +974,13 @@ async def catalogue_auto_worker():
                 await _refresh_catalogues()
                 sync_elapsed = 0
             await _bulk_discovery_step()
-            mins = max(15, min(1440, int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))))
+            mins = max(1, min(1440, int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '1'))))
             interval_seconds = mins * 60
             if elapsed >= interval_seconds:
-                if catalogue_setting('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true':
-                    await process_approved(max_items=10)
+                if (catalogue_setting('CATALOGUE_AUTO_HUNT', 'false').lower() == 'true'
+                        and catalogue_setting('CATALOGUE_ENABLE_GAME_IMPORT', 'false').lower() == 'true'):
+                    batch = max(1, min(20, int(catalogue_setting('CATALOGUE_GAME_BATCH_SIZE', '5'))))
+                    await process_approved(max_items=batch)
                 elapsed = 0
         except Exception:
             import logging
