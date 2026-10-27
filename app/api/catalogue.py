@@ -81,11 +81,6 @@ async def catalogue_cache_status():
         {'count': 0, 'updated_at': None, 'stale': True}
         for name in CACHE_KINDS}}
 
-@router.post('/api/catalogue/cache/refresh', dependencies=[Depends(_require_write_token)])
-async def refresh_catalogue_cache():
-    # Explicit refresh; GET endpoints remain read-only and show saved data.
-    return await _refresh_catalogues(force=True)
-
 async def _refresh_catalogues(*, force=False):
     if _cache_refresh_lock.locked():
         return {'state': 'already_running'}
@@ -116,6 +111,12 @@ def _require_write_token(x_catalogue_token: str | None = Header(default=None)):
         return  # Match Vanguarr's existing LAN settings behaviour when no approval token is configured.
     if not x_catalogue_token or not secrets.compare_digest(expected, x_catalogue_token):
         raise HTTPException(403, 'Catalogue write access denied')
+
+@router.post('/api/catalogue/cache/refresh', dependencies=[Depends(_require_write_token)])
+async def refresh_catalogue_cache():
+    # Explicit refresh; GET endpoints remain read-only and show saved data.
+    return await _refresh_catalogues(force=True)
+
 
 
 # Runtime settings in the existing /data persistent volume. Environment values remain
