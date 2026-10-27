@@ -47,6 +47,18 @@ CONFIG_FIELDS = {
  'CATALOGUE_WANT_EBOOK': 'bool', 'CATALOGUE_WANT_AUDIOBOOK': 'bool',
 }
 
+# Values used when a new installation has not yet saved the optional fields.
+CATALOGUE_DEFAULTS = {
+    'CATALOGUE_DEFAULT_MIN_RATING': '70',
+    'CATALOGUE_DEFAULT_MAX_PER_PLATFORM': '250',
+    'CATALOGUE_HUNT_INTERVAL_MINUTES': '360',
+    'CATALOGUE_INCLUDE_UNRATED': 'false',
+    'CATALOGUE_WANT_EBOOK': 'true',
+    'CATALOGUE_WANT_AUDIOBOOK': 'true',
+    'CATALOGUE_AUTO_HUNT': 'false',
+    'CATALOGUE_ENABLE_GAME_IMPORT': 'false',
+}
+
 def _saved_settings():
     """Read catalogue settings from Vanguarr's existing app_settings database.
 
@@ -69,9 +81,9 @@ def _saved_settings():
 
 def catalogue_setting(name: str, default: str = '') -> str:
     saved = _saved_settings()
-    if name in saved:
-        return saved[name]
-    return os.environ.get(name, default)
+    if name in saved and str(saved[name] or '').strip():
+        return str(saved[name])
+    return os.environ.get(name) or CATALOGUE_DEFAULTS.get(name, default)
 
 class CatalogueSettingsUpdate(BaseModel):
     settings: dict[str, str | int | bool]
@@ -81,7 +93,7 @@ async def get_catalogue_settings():
     saved = _saved_settings()
     fields = {}
     for name, kind in CONFIG_FIELDS.items():
-        value = str(saved.get(name, os.getenv(name, '')))
+        value = str(saved.get(name) or os.getenv(name) or CATALOGUE_DEFAULTS.get(name, ''))
         fields[name] = {'type': kind, 'value': '' if kind == 'secret' else value,
                         'configured': bool(value)}
     return {'fields': fields}
@@ -107,8 +119,11 @@ async def update_catalogue_settings(payload: CatalogueSettingsUpdate, request: R
                 raise HTTPException(400, f'Invalid URL for {name}')
             value = value.rstrip('/')
         if kind == 'int':
+            if not value:
+                # Optional number left blank: restore the documented default.
+                value = CATALOGUE_DEFAULTS.get(name, '')
             try: number = int(value)
-            except ValueError: raise HTTPException(400, f'Invalid number for {name}')
+            except (TypeError, ValueError): raise HTTPException(400, f'Invalid number for {name}')
             if not (0 <= number <= 10000): raise HTTPException(400, f'Out of range: {name}')
             value = str(number)
         if kind == 'bool':
