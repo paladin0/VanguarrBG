@@ -6,7 +6,7 @@ import os
 import asyncio
 import secrets
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from threading import Lock
 from urllib.parse import urlparse
@@ -24,6 +24,90 @@ _lock = Lock()
 DATA_FILE = Path(os.environ.get('CATALOGUE_REVIEW_FILE', '/data/catalogue-review.json'))
 BULK_FILE = DATA_FILE.with_name('catalogue-bulk-job.json')
 _bulk_step_lock = asyncio.Lock()
+CACHE_DIR = DATA_FILE.parent / 'catalogue-cache'
+CACHE_TTL_SECONDS = 1800
+CACHE_KINDS = ('authors', 'books', 'platforms', 'retroarr_platforms', 'games')
+_cache_refresh_lock = asyncio.Lock()
+
+def _cache_path(kind: str):
+    if kind not in CACHE_KINDS:
+        raise HTTPException(400, 'Invalid catalogue cache')
+    return CACHE_DIR / (kind + '.json')
+
+def _cache_read(kind):
+    try:
+        obj = json.loads(_cache_path(kind).read_text(encoding='utf-8'))
+        if isinstance(obj, dict) and isinstance(obj.get('items'), list):
+            return obj
+    except (OSError, ValueError):
+        pass
+    return None
+
+def _cache_store(kind, items):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    result = {'items': items, 'count': len(items),
+              'updated_at': datetime.now(timezone.utc).isoformat()}
+    path = _cache_path(kind)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
+    tmp.replace(path)
+    return result
+
+def _cache_fresh(obj):
+    try:
+        dt = datetime.fromisoformat(obj['updated_at'])
+        return (datetime.now(timezone.utc) - dt).total_seconds() < CACHE_TTL_SECONDS
+    except (KeyError, ValueError, TypeError):
+        return False
+
+async def _cached_fetch(kind, fetcher, *, force=False):
+    previous = _cache_read(kind)
+    if previous and not force:
+        return {**previous, 'cached': True}
+    try:
+        items = await fetcher()
+        return {**_cache_store(kind, items), 'cached': False}
+    except Exception as exc:
+        if previous:
+            return {**previous, 'cached': True, 'stale': True,
+                    'sync_error': str(exc)[:180]}
+        raise
+
+@router.get('/api/catalogue/cache/status')
+async def catalogue_cache_status():
+    return {'collections': {name: {
+        'count': len(obj['items']), 'updated_at': obj['updated_at'],
+        'stale': not _cache_fresh(obj)} if (obj := _cache_read(name)) else
+        {'count': 0, 'updated_at': None, 'stale': True}
+        for name in CACHE_KINDS}}
+
+@router.post('/api/catalogue/cache/refresh', dependencies=[Depends(_require_write_token)])
+async def refresh_catalogue_cache():
+    # Explicit refresh; GET endpoints remain read-only and show saved data.
+    return await _refresh_catalogues(force=True)
+
+async def _refresh_catalogues(*, force=False):
+    if _cache_refresh_lock.locked():
+        return {'state': 'already_running'}
+    outcomes = {}
+    async with _cache_refresh_lock:
+        for name, fetcher in (
+            ('authors', _fetch_authors), ('books', _fetch_books),
+            ('retroarr_platforms', _fetch_retroarr_platforms),
+            ('platforms', _fetch_igdb_platforms), ('games', _fetch_games)):
+            old = _cache_read(name)
+            if old and _cache_fresh(old) and not force:
+                continue
+            try:
+                data = await fetcher()
+                saved = _cache_store(name, data)
+                outcomes[name] = {'count': saved['count'], 'ok': True}
+            except Exception as exc:
+                outcomes[name] = {'ok': False, 'error': str(exc)[:180],
+                                  'previous_data_preserved': old is not None}
+            await asyncio.sleep(.25)
+    return {'state': 'completed', 'collections': outcomes}
+
 
 
 def _require_write_token(x_catalogue_token: str | None = Header(default=None)):
@@ -241,32 +325,63 @@ async def catalogue_page(request: Request):
     return templates.TemplateResponse(request, 'catalogue.html', {'page_title': 'Books & Games Catalogue', 'path': '/catalogue'})
 
 
-@router.get('/api/catalogue/books/authors')
-async def authors():
-    data = await _json_get(_configured_url('CATALOGUE_LAZYLIBRARIAN_URL') + '/api', params={'cmd':'getIndex','apikey':_lazy_key()})
-    data = _unwrap_catalogue_records(data, label='LazyLibrarian authors',
-                                     candidates=('authors', 'Authors', 'items', 'data'))
-    return {'count': len(data), 'items': [{'id': str(a.get('AuthorID','')), 'name':a.get('AuthorName',''), 'status':a.get('Status',''), 'books':a.get('TotalBooks',0)} for a in data if isinstance(a,dict)]}
+async def _fetch_authors():
+    data = await _json_get(_configured_url('CATALOGUE_LAZYLIBRARIAN_URL') + '/api',
+                           params={'cmd':'getIndex','apikey':_lazy_key()})
+    records = _unwrap_catalogue_records(data, label='LazyLibrarian authors',
+                                        candidates=('authors','Authors','items','data'))
+    return [{'id': str(a.get('AuthorID','')), 'name':a.get('AuthorName',''),
+             'status':a.get('Status',''), 'books':a.get('TotalBooks',0)}
+            for a in records if isinstance(a,dict)]
 
+async def _fetch_books():
+    data = await _json_get(_configured_url('CATALOGUE_LAZYLIBRARIAN_URL') + '/api',
+                           params={'cmd':'getAllBooks','apikey':_lazy_key()})
+    records = _unwrap_catalogue_records(data, label='LazyLibrarian books',
+                                        candidates=('books','Books','items','data'))
+    return [{'id':str(b.get('BookID','')), 'title':b.get('BookName',''),
+             'author':b.get('AuthorName',''), 'ebook':b.get('Status',''),
+             'audiobook':b.get('AudioStatus','')}
+            for b in records if isinstance(b,dict)]
 
-@router.get('/api/catalogue/books/titles')
-async def books(limit: int = Query(250, ge=1, le=1000)):
-    data = await _json_get(_configured_url('CATALOGUE_LAZYLIBRARIAN_URL') + '/api', params={'cmd':'getAllBooks','apikey':_lazy_key()})
-    data = _unwrap_catalogue_records(data, label='LazyLibrarian books',
-                                     candidates=('books', 'Books', 'items', 'data'))
-    return {'count':len(data), 'items':[{'id':str(b.get('BookID','')), 'title':b.get('BookName',''), 'author':b.get('AuthorName',''), 'ebook':b.get('Status',''), 'audiobook':b.get('AudioStatus','')} for b in data[:limit] if isinstance(b,dict)]}
+async def _fetch_games():
+    key = catalogue_setting('CATALOGUE_RETROARR_KEY', '').strip()
+    if not key:
+        raise HTTPException(503,'RetroArr API key not configured')
+    data = await _json_get(_configured_url('CATALOGUE_RETROARR_URL') + '/api/v3/game',
+                           headers={'X-Api-Key':key})
+    return _unwrap_catalogue_records(data, label='RetroArr games',
+                                     candidates=('records','items','data'))
 
-
-@router.get('/api/catalogue/games/library')
-async def games_library():
-    base = _configured_url('CATALOGUE_RETROARR_URL')
+async def _fetch_retroarr_platforms():
     key = catalogue_setting('CATALOGUE_RETROARR_KEY', '').strip()
     if not key:
         raise HTTPException(503, 'RetroArr API key not configured')
-    data = await _json_get(base + '/api/v3/game',headers={'X-Api-Key':key})
-    items = _unwrap_catalogue_records(data, label='RetroArr games',
-                                      candidates=('records', 'items', 'data'))
-    return {'count':len(items),'items':items[:500]}
+    data = await _json_get(_configured_url('CATALOGUE_RETROARR_URL') + '/api/v3/platform',
+                           headers={'X-Api-Key': key})
+    records = _unwrap_catalogue_records(data, label='RetroArr platforms',
+                                        candidates=('records', 'items', 'data'))
+    return [{'id': int(p['id']), 'igdbPlatformId':p.get('igdbPlatformId'),
+             'name':p.get('name',''), 'enabled':bool(p.get('enabled', False))}
+            for p in records if isinstance(p,dict) and p.get('id') is not None]
+
+@router.get('/api/catalogue/books/authors')
+async def authors(force: bool = False):
+    return await _cached_fetch('authors', _fetch_authors, force=force)
+
+@router.get('/api/catalogue/books/titles')
+async def books(limit: int = Query(250, ge=1, le=10000), force: bool = False):
+    result = await _cached_fetch('books', _fetch_books, force=force)
+    return {**result, 'items':result['items'][:limit]}
+
+@router.get('/api/catalogue/games/library')
+async def games_library(force: bool = False):
+    result = await _cached_fetch('games', _fetch_games, force=force)
+    return {**result, 'items':result['items'][:500]}
+
+@router.get('/api/catalogue/games/retroarr-platforms')
+async def retroarr_platforms(force: bool = False):
+    return await _cached_fetch('retroarr_platforms', _fetch_retroarr_platforms, force=force)
 
 
 async def _igdb_token():
@@ -310,18 +425,20 @@ async def _igdb_query(endpoint, query):
         raise HTTPException(502, 'IGDB query failed (' + type(exc).__name__ + ')') from exc
 
 
-@router.get('/api/catalogue/games/platforms')
-async def platforms():
-    # Pages of 500. Includes classic computers, handhelds and arcades.
-    all_platforms=[]
+async def _fetch_igdb_platforms():
+    all_platforms = []
     for offset in range(0, 5000, 500):
-        batch=await _igdb_query('platforms',f'fields id,name,abbreviation,category; sort name asc; limit 500; offset {offset};')
+        batch = await _igdb_query('platforms',
+            f'fields id,name,abbreviation,category; sort name asc; limit 500; offset {offset};')
         all_platforms.extend(batch)
-        if len(batch)<500:
+        if len(batch) < 500:
             break
-    # Deduplicate platform entries; IGDB occasionally repeats results across pages.
-    distinct = {int(p['id']): p for p in all_platforms if p.get('id')}
-    return {'count':len(distinct),'items':list(distinct.values())}
+    distinct = {int(p['id']):p for p in all_platforms if p.get('id')}
+    return list(distinct.values())
+
+@router.get('/api/catalogue/games/platforms')
+async def platforms(force: bool = False):
+    return await _cached_fetch('platforms', _fetch_igdb_platforms, force=force)
 
 
 @router.get('/api/catalogue/games/discover')
@@ -357,6 +474,7 @@ async def discover(platform_id: int = Query(...,gt=0),min_rating: float | None =
 class BulkDiscoveryRequest(BaseModel):
     platform_ids: list[int] = Field(default_factory=list, max_length=1000)
     all_platforms: bool = False
+    retroarr_supported_only: bool = True
     min_rating: float = Field(default=70, ge=0, le=100)
     max_per_platform: int = Field(default=250, ge=1, le=2500)
     include_unrated: bool = False
@@ -399,12 +517,19 @@ async def start_bulk(req: BulkDiscoveryRequest):
         ids = sorted(set(int(p['id']) for p in entries if int(p.get('id') or 0) > 0))
     else:
         ids = sorted(set(i for i in req.platform_ids if i > 0))
+    if req.retroarr_supported_only:
+        retro = (await retroarr_platforms())['items']
+        supported = {int(p['igdbPlatformId']) for p in retro
+                     if p.get('enabled') and p.get('igdbPlatformId') is not None}
+        ids = [i for i in ids if i in supported]
+
     if not ids:
         raise HTTPException(400, 'Choose at least one platform')
     job = {'state': 'running', 'platform_ids': ids, 'next_index': 0,
            'queued': 0, 'skipped': 0, 'errors': [], 'current_platform': None,
            'min_rating': req.min_rating, 'max_per_platform': req.max_per_platform,
            'include_unrated': req.include_unrated, 'approve_matching': req.approve_matching,
+           'retroarr_supported_only': req.retroarr_supported_only,
            'started_at': datetime.now(timezone.utc).isoformat()}
     with _lock:
         _save_bulk(job)
@@ -631,8 +756,16 @@ async def _import_game(item: dict):
     if igdb_id <= 0 or igdb_platform <= 0:
         raise RuntimeError('A valid IGDB game ID and platform ID are required')
 
-    platform = await _retroarr_request('GET', f'/api/v3/platform/by-igdb/{igdb_platform}')
-    platform_id = int(platform.get('id') or 0)
+    # The configured platform catalogue is authoritative, even for empty libraries.
+    # Multiple RetroArr systems may share a single IGDB mapping; favour the
+    # primary enabled platform by its lowest internal ID, never an arbitrary game.
+    configured = (await retroarr_platforms())['items']
+    matches = sorted((p for p in configured if p.get('enabled')
+                      and p.get('igdbPlatformId') is not None
+                      and int(p['igdbPlatformId']) == igdb_platform), key=lambda p: p['id'])
+    if not matches:
+        raise RuntimeError(f'IGDB platform {igdb_platform} has no enabled RetroArr mapping')
+    platform_id = int(matches[0]['id'])
     if platform_id <= 0:
         raise RuntimeError(f'IGDB platform {igdb_platform} has no RetroArr mapping')
 
@@ -779,8 +912,26 @@ async def recommend(request: RecommendRequest):
     system = ('You are a media recommendation librarian. Recommend real, existing titles '
               'and their creators only. Do not claim availability or ownership. '
               'Do not invent IDs. Return concise numbered suggestions.')
+    # Include a bounded, non-sensitive slice of the synchronised catalogues.
+    # This is context for suggestions only; no LLM outputs are automatically imported.
+    context_lines = []
+    if request.medium == 'books':
+        authors_cache = _cache_read('authors') or {'items': []}
+        books_cache = _cache_read('books') or {'items': []}
+        context_lines.append(f'Saved catalogue: {len(authors_cache["items"])} authors; {len(books_cache["items"])} tracked books.')
+        for book in books_cache['items'][:60]:
+            context_lines.append(f'Tracked: {str(book.get("title") or "")[:90]} by {str(book.get("author") or "")[:60]}')
+    else:
+        games_cache = _cache_read('games') or {'items': []}
+        platform_cache = _cache_read('retroarr_platforms') or {'items': []}
+        context_lines.append(f'Saved RetroArr catalogue: {len(games_cache["items"])} games; {len(platform_cache["items"])} configured platforms.')
+        for game in games_cache['items'][:60]:
+            context_lines.append(f'Library game: {str(game.get("title") or "")[:100]}')
     prompt = (f'Offer up to {request.limit} {request.medium} based on this preference: '
-              f'{request.preference}. For books give title and author; for games give title and platforms.')
+              f'{request.preference}. For books give title and author; for games give title and platforms. '
+              'Do not recommend duplicates already in the sample inventory; the sample is incomplete. '
+              'All suggestions require review and metadata verification.\n'
+              + '\n'.join(context_lines))
     try:
         text = await llm.generate_text(system_prompt=system, user_prompt=prompt,
                                        max_tokens=1000, temperature=0.4)
@@ -793,8 +944,12 @@ async def catalogue_auto_worker():
     # One persistent discovery step every 20 seconds, including after restart.
     # Approved imports run separately at the configured interval and are opt-in.
     elapsed = 0
+    sync_elapsed = CACHE_TTL_SECONDS
     while True:
         try:
+            if sync_elapsed >= CACHE_TTL_SECONDS:
+                await _refresh_catalogues()
+                sync_elapsed = 0
             await _bulk_discovery_step()
             mins = max(15, min(1440, int(catalogue_setting('CATALOGUE_HUNT_INTERVAL_MINUTES', '360'))))
             interval_seconds = mins * 60
@@ -807,6 +962,7 @@ async def catalogue_auto_worker():
             logging.getLogger(__name__).exception('Catalogue worker iteration failed')
         await asyncio.sleep(20)
         elapsed += 20
+        sync_elapsed += 20
 
 @router.get('/api/catalogue/games/capabilities')
 async def retroarr_capabilities():
